@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
+from fate import fate_bar
 from locks import release, require_lock
 from models import OverloadCloseIn, OverloadOpenIn
 from validators import adjudicate_overload, validate_ticket_mutable
@@ -42,6 +43,9 @@ def open_overload(body: OverloadOpenIn, authorization: AuthHeader = None):
             if not ticket:
                 raise HTTPException(404, "过磅票不存在")
             validate_ticket_mutable(dict(ticket))
+            fate = fate_bar(conn, ticket["vehicle_plate"])
+            if fate["current_ticket_code"] != ticket["ticket_code"]:
+                raise HTTPException(409, "非当前正式票，不得挂起")
             open_one = conn.execute(
                 """SELECT id FROM overload_holds WHERE ticket_id=? AND status='开放'""",
                 (body.ticket_id,),
@@ -116,7 +120,11 @@ def close_overload(body: OverloadCloseIn, authorization: AuthHeader = None):
                    WHERE ticket_id=? AND status='开放'""",
                 (hold["ticket_id"],),
             ).fetchone()["c"]
-            if not open_left:
+            ticket = conn.execute(
+                "SELECT status FROM weigh_tickets WHERE id=?", (hold["ticket_id"],)
+            ).fetchone()
+            # 作废票闭环不得复活为正式：升代作废旧票后其挂起随事务关闭
+            if not open_left and ticket["status"] != "作废":
                 conn.execute(
                     """UPDATE weigh_tickets SET status='已裁定', adjudicated_at=?
                        WHERE id=?""",

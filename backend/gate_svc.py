@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
+from fate import fate_bar
 from locks import release, require_lock
 from models import GateReleaseIn
 from validators import validate_no_open_overload, validate_ticket_mutable
@@ -46,6 +47,14 @@ def release_gate(body: GateReleaseIn, authorization: AuthHeader = None):
             if ticket["status"] == "旁路挂起":
                 raise HTTPException(409, "旁路挂起须先闭环")
             validate_no_open_overload(conn, body.ticket_id)
+            # 同车升代：只准当前正式票放行，旧代/作废/偏航一律拒
+            fate = fate_bar(conn, ticket["vehicle_plate"])
+            if not fate["chain_ok"]:
+                raise HTTPException(
+                    409, "升代命运条偏航，拒放行：" + "；".join(fate["issues"])
+                )
+            if fate["current_ticket_code"] != ticket["ticket_code"]:
+                raise HTTPException(409, "非当前正式票，不得放行")
             exists = conn.execute(
                 "SELECT id FROM gate_releases WHERE ticket_id=? AND status='已放行'",
                 (body.ticket_id,),

@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
+from fate import formal_tickets
 from locks import release, require_lock
 from models import SealIn
 from validators import format_manifest, validate_ticket_sealable
@@ -38,8 +39,14 @@ def create_seal(body: SealIn, authorization: AuthHeader = None):
             if not ticket:
                 raise HTTPException(404, "过磅票不存在")
             validate_ticket_sealable(dict(ticket))
+            if ticket["status"] == "作废":
+                raise HTTPException(409, "作废票不得封闸")
             if ticket["status"] == "旁路挂起":
                 raise HTTPException(409, "旁路挂起不得封闸")
+            # 只允许当前晋升票封闸：旧代/影子票不得再出新代快照
+            current = formal_tickets(conn, ticket["vehicle_plate"])
+            if len(current) != 1 or int(current[0]["id"]) != int(ticket["id"]):
+                raise HTTPException(409, "非当前正式票，不得封闸升代")
             open_hold = conn.execute(
                 """SELECT id FROM overload_holds WHERE ticket_id=? AND status='开放'""",
                 (body.ticket_id,),

@@ -90,8 +90,12 @@ CREATE TABLE IF NOT EXISTS weigh_tickets(
   status TEXT NOT NULL,
   adjudicated_at TEXT,
   created_at TEXT NOT NULL,
+  voided_at TEXT,
+  void_reason TEXT,
+  superseded_by INTEGER,
   FOREIGN KEY(lane_id) REFERENCES weigh_lanes(id)
 );
+CREATE INDEX IF NOT EXISTS idx_tickets_plate ON weigh_tickets(vehicle_plate, generation);
 CREATE TABLE IF NOT EXISTS overload_holds(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ticket_id INTEGER NOT NULL,
@@ -436,9 +440,28 @@ def seed_lineage_samples(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧库补列：二次升代需记旧票作废时间、原因与新代指向。"""
+    cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(weigh_tickets)").fetchall()
+    }
+    for name, ddl in (
+        ("voided_at", "ALTER TABLE weigh_tickets ADD COLUMN voided_at TEXT"),
+        ("void_reason", "ALTER TABLE weigh_tickets ADD COLUMN void_reason TEXT"),
+        ("superseded_by", "ALTER TABLE weigh_tickets ADD COLUMN superseded_by INTEGER"),
+    ):
+        if name not in cols:
+            conn.execute(ddl)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tickets_plate "
+        "ON weigh_tickets(vehicle_plate, generation)"
+    )
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         seed_users(conn)
         seed_bridges(conn)
         seed_lanes(conn)

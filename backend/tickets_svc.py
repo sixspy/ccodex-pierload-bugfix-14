@@ -7,7 +7,8 @@ from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
-from locks import release, require_lock
+from fate import LOCKED_STATUSES, REWEIGH_EDGE, VOID_STATUS, fate_bar, formal_tickets
+from locks import require_lock, release
 from models import TicketIn
 from validators import (
     adjudicate_overload,
@@ -91,10 +92,19 @@ def get_ticket(ticket_id: int, authorization: AuthHeader = None):
 @router.post("/api/tickets")
 def create_ticket(body: TicketIn, authorization: AuthHeader = None):
     user = require_writer(authorization)
-    lock_key = f"lane:{body.lane_id}"
+    plate = body.vehicle_plate.strip()
+    if not plate:
+        raise HTTPException(422, "车牌不能为空")
+    # 先抢车号锁再抢车道锁，避免两车同车道/同车两车道互锁
+    lock_keys = [f"plate:{plate}", f"lane:{body.lane_id}"]
     with connect() as conn:
-        require_lock(conn, lock_key, user)
+        acquired: list[str] = []
         try:
+            for key in lock_keys:
+                # 抢锁即提交：争用痕与锁簿记不得被业务回滚带走
+                require_lock(conn, key, user)
+                acquired.append(key)
+
             lane = conn.execute(
                 """SELECT l.*, b.max_gross_t, b.axle_limit FROM weigh_lanes l
                    JOIN weigh_bridges b ON b.id=l.bridge_id WHERE l.id=?""",
@@ -115,18 +125,45 @@ def create_ticket(body: TicketIn, authorization: AuthHeader = None):
             is_over, overweight = adjudicate_overload(
                 gross, float(lane["overload_threshold_t"])
             )
+
+            # 同车升代：命运条偏航（双正式/旧票漏废）一律拒写
+            fate = fate_bar(conn, plate)
+            if not fate["chain_ok"]:
+                # 偏航痕单独落库：业务整笔回滚不得抹掉拒写依据
+                with connect() as trail:
+                    write_audit(
+                        trail,
+                        user,
+                        "reweigh_fate_deviation",
+                        plate,
+                        {"issues": fate["issues"], "gross_t": gross},
+                    )
+                    trail.commit()
+                raise HTTPException(
+                    409,
+                    "升代命运条偏航，拒写：" + "；".join(fate["issues"]),
+                )
+            existing = formal_tickets(conn, plate)
+            if existing:
+                live = existing[0]
+                if live["status"] in LOCKED_STATUSES:
+                    raise HTTPException(409, "当班命运条已锁死，不得再磅")
+                if live["lane_id"] != body.lane_id:
+                    raise HTTPException(409, "同车再磅须回原车道")
+                if live["bl_ref"] != body.bl_ref:
+                    raise HTTPException(409, "同车再磅不得改挂提单")
+            next_gen = 1 + max(
+                (int(t["generation"]) for t in formal_tickets(conn, plate)),
+                default=0,
+            )
+
             code = body.ticket_code or _next_ticket_code(conn, body.lane_id)
             if conn.execute(
                 "SELECT id FROM weigh_tickets WHERE ticket_code=?", (code,)
             ).fetchone():
                 raise HTTPException(409, "票号已存在")
-            # BUGFIX-14 埋雷：同车二次过磅不废旧票，双正式并存
-            # （故意不 UPDATE 同车牌旧票为作废）
             now = now_iso()
-            if is_over:
-                status = "旁路挂起"
-            else:
-                status = "已裁定"
+            status = "旁路挂起" if is_over else "已裁定"
             cur = conn.execute(
                 """INSERT INTO weigh_tickets(ticket_code,lane_id,bl_ref,vehicle_plate,
                    axle_weights,gross_t,generation,status,adjudicated_at,created_at)
@@ -135,16 +172,45 @@ def create_ticket(body: TicketIn, authorization: AuthHeader = None):
                     code,
                     body.lane_id,
                     body.bl_ref,
-                    body.vehicle_plate,
+                    plate,
                     json.dumps(axles, ensure_ascii=False),
                     gross,
-                    1,
+                    next_gen,
                     status,
                     now if status == "已裁定" else None,
                     now,
                 ),
             )
             ticket_id = cur.lastrowid
+
+            voided_codes: list[str] = []
+            for old in existing:
+                # 同一事务作废旧正式票：旧票零残留，新票才是唯一正式
+                conn.execute(
+                    """UPDATE weigh_tickets
+                       SET status=?, voided_at=?, void_reason=?, superseded_by=?
+                       WHERE id=?""",
+                    (VOID_STATUS, now, REWEIGH_EDGE, ticket_id, old["id"]),
+                )
+                conn.execute(
+                    """UPDATE overload_holds
+                       SET status='已关闭', closed_at=?, side_lane_note=?
+                       WHERE ticket_id=? AND status='开放'""",
+                    (now, f"{REWEIGH_EDGE}→{code}", old["id"]),
+                )
+                conn.execute(
+                    """INSERT INTO axle_lineage(from_ticket_id,to_ticket_id,edge_type,
+                       detail,created_at) VALUES (?,?,?,?,?)""",
+                    (
+                        old["id"],
+                        ticket_id,
+                        REWEIGH_EDGE,
+                        f"同车再磅 {old['ticket_code']}→{code}（G{old['generation']}→G{next_gen}）",
+                        now,
+                    ),
+                )
+                voided_codes.append(old["ticket_code"])
+
             if is_over:
                 hold_key = f"HOLD-{code}"
                 conn.execute(
@@ -170,6 +236,8 @@ def create_ticket(body: TicketIn, authorization: AuthHeader = None):
                     "gross_t": gross,
                     "status": status,
                     "overload": is_over,
+                    "generation": next_gen,
+                    "voided": voided_codes,
                 },
             )
             conn.commit()
@@ -179,6 +247,13 @@ def create_ticket(body: TicketIn, authorization: AuthHeader = None):
                 "gross_t": gross,
                 "status": status,
                 "overload": is_over,
+                "generation": next_gen,
+                "voided_ticket_codes": voided_codes,
             }
+        except BaseException:
+            # 任一步失败整笔回滚：不留半截新票/旧票作废
+            conn.rollback()
+            raise
         finally:
-            release(conn, lock_key, user)
+            for key in reversed(acquired):
+                release(conn, key, user)

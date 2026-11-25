@@ -36,6 +36,8 @@ export function createApi(getToken, onUnauthorized) {
     registerBl: (d) => req("/api/bl", { method: "POST", body: JSON.stringify(d) }),
     lineage: () => req("/api/lineage"),
     addLineage: (d) => req("/api/lineage", { method: "POST", body: JSON.stringify(d) }),
+    lineageFates: () => req("/api/lineage/fates"),
+    lineageFate: (plate) => req(`/api/lineage/fate/${encodeURIComponent(plate)}`),
     reconcileAll: () => req("/api/reconcile"),
     reconcileOne: (code) => req(`/api/reconcile/${encodeURIComponent(code)}`),
     proofTicket: (code) => req(`/api/proof/ticket/${encodeURIComponent(code)}`),

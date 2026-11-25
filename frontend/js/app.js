@@ -34,6 +34,7 @@ createApp({
     const seals = ref([]);
     const blList = ref([]);
     const lineageEdges = ref([]);
+    const fates = ref([]);
     const customsJobs = ref([]);
     const craneJobs = ref([]);
     const bridgeDetail = ref(null);
@@ -85,6 +86,65 @@ createApp({
     const sealableTickets = computed(() =>
       tickets.value.filter((t) => ["已裁定","已放行"].includes(t.status))
     );
+    // 同车升代命运条：五页共用同一口径
+    function fateOf(plate) {
+      return fates.value.find((f) => f.vehicle_plate === plate) || null;
+    }
+    function ticketFate(t) {
+      return t ? fateOf(t.vehicle_plate) : null;
+    }
+    function fateBadge(t) {
+      const f = ticketFate(t);
+      if (!f) return "无命运";
+      if (!f.chain_ok) return "偏航";
+      if (f.shift_closed) return "当班锁死";
+      if (f.locked) return "单正式·锁";
+      return "单正式";
+    }
+    function fateClass(t) {
+      const f = ticketFate(t);
+      if (!f || !f.chain_ok) return "fail";
+      if (f.shift_closed) return "muted";
+      return "pass";
+    }
+    // 车道页：在道正式票与偏航同一口径
+    function laneFates(laneId) {
+      const plates = new Set(
+        tickets.value.filter((t) => t.lane_id === laneId).map((t) => t.vehicle_plate)
+      );
+      return fates.value.filter((f) => plates.has(f.vehicle_plate));
+    }
+    function laneFormalCount(laneId) {
+      return laneFates(laneId).reduce((n, f) => n + f.formal_count, 0);
+    }
+    function laneFateIssues(laneId) {
+      return laneFates(laneId).flatMap((f) =>
+        f.issues.map((x) => `${f.vehicle_plate}：${x}`)
+      );
+    }
+    function fateIssueRows() {
+      return fates.value
+        .filter((f) => !f.chain_ok)
+        .map((f) => ({
+          vehicle_plate: f.vehicle_plate,
+          ticket_code: f.current_ticket_code,
+          issues: f.issues,
+        }));
+    }
+    // 快照页：按车牌取命运条，校验快照代是否为当前代
+    function sealFate(seal) {
+      if (!seal) return null;
+      const t = tickets.value.find((x) => x.id === seal.ticket_id);
+      return t ? fateOf(t.vehicle_plate) : null;
+    }
+    function voidedCodes(rows) {
+      return (rows || []).map((r) => r.ticket_code).join("、");
+    }
+    const fateSummary = computed(() => {
+      const total = fates.value.length;
+      const ok = fates.value.filter((f) => f.chain_ok).length;
+      return { total, ok, drift: total - ok, hasDrift: total - ok > 0 };
+    });
 
     function fmtT(n) {
       if (n == null || n === "") return "—";
@@ -126,10 +186,10 @@ createApp({
       if (!token.value) return;
       clearFlash();
       try {
-        const [d, br, ln, tk, ov, gr, sl, bl, lg, cj, cj2] = await Promise.all([
+        const [d, br, ln, tk, ov, gr, sl, bl, lg, cj, cj2, ft] = await Promise.all([
           api.dashboard(), api.bridges(), api.lanes(), api.tickets(), api.overloads(),
           api.gateReleases(), api.seals(), api.blList(), api.lineage(),
-          api.customsJobs(), api.craneJobs(),
+          api.customsJobs(), api.craneJobs(), api.lineageFates(),
         ]);
         dash.value = d || {};
         bridges.value = br.items || [];
@@ -140,6 +200,7 @@ createApp({
         seals.value = sl.items || [];
         blList.value = bl.items || [];
         lineageEdges.value = lg.items || [];
+        fates.value = ft.items || [];
         customsJobs.value = cj.items || [];
         craneJobs.value = cj2.items || [];
         if (bridges.value.length) {
@@ -262,11 +323,14 @@ createApp({
     return {
       token, user, username, password, err, actionErr, actionOk, tab, nav,
       dash, bridges, lanes, tickets, overloads, gateReleases, seals, blList,
-      lineageEdges, customsJobs, craneJobs, bridgeDetail, ticketDetail,
+      lineageEdges, fates, customsJobs, craneJobs, bridgeDetail, ticketDetail,
       reconOne, reconAllItems, proofOne, reconCode, proofCode,
       bridgeForm, laneForm, ticketForm, overloadOpenForm, gateForm, sealForm,
       blForm, lineageForm, customsForm, craneForm,
       adjudicableTickets, releasableTickets, sealableTickets,
+      fateOf, ticketFate, fateBadge, fateClass,
+      laneFates, laneFormalCount, laneFateIssues, fateIssueRows, sealFate,
+      voidedCodes, fateSummary,
       login, logout, refresh,
       fmtT, ticketClass, shortText,
       createBridge, loadBridgeDetail, createLane, createTicket, loadTicketDetail, selectTicket,
